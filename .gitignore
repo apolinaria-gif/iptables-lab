@@ -1,11 +1,29 @@
+﻿# Vagrant
 .vagrant/
-.git/
-*.log
-*.tmp
-*.swp
+**/.vagrant/
+
+# SSH private keys and credentials
 *.pem
 *.key
 id_rsa
 id_ed25519
-ansible-keys/
-__pycache__/
+*_private_key
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Ansible
+*.retry
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

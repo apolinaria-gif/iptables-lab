@@ -1,0 +1,340 @@
+
+---
+# ============================================================
+# 1. inetRouter: интернет, NAT и port knocking
+# ============================================================
+
+- name: Configure inetRouter and port knocking
+  hosts: inet_router
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - knockd
+          - iptables-persistent
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Configure knockd
+      ansible.builtin.copy:
+        dest: /etc/knockd.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [options]
+          UseSyslog
+
+          [openSSH]
+          sequence = 7000,8000,9000
+          seq_timeout = 10
+          tcpflags = syn
+          command = /sbin/iptables -I INPUT 1 -s %IP% -p tcp --dport 22 -j ACCEPT
+          cmd_timeout = 30
+          stop_command = /sbin/iptables -D INPUT -s %IP% -p tcp --dport 22 -j ACCEPT
+
+    - name: Enable knockd
+      ansible.builtin.copy:
+        dest: /etc/default/knockd
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          START_KNOCKD=1
+          KNOCKD_OPTS="-i eth1"
+
+    - name: Enable IPv4 forwarding
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        state: present
+        sysctl_set: true
+        reload: true
+
+    - name: Configure internet forwarding and NAT
+      ansible.builtin.shell: |
+        set -e
+
+        iptables -C FORWARD -i eth1 -o eth0 -s 192.168.0.0/16 -j ACCEPT 2>/dev/null || \
+          iptables -A FORWARD -i eth1 -o eth0 -s 192.168.0.0/16 -j ACCEPT
+
+        iptables -C FORWARD -i eth0 -o eth1 -d 192.168.0.0/16 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+          iptables -A FORWARD -i eth0 -o eth1 -d 192.168.0.0/16 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+        iptables -t nat -C POSTROUTING -s 192.168.0.0/16 -o eth0 -j MASQUERADE 2>/dev/null || \
+          iptables -t nat -A POSTROUTING -s 192.168.0.0/16 -o eth0 -j MASQUERADE
+      args:
+        executable: /bin/bash
+
+    - name: Block new SSH connections until port knocking
+      ansible.builtin.shell: |
+        iptables -C INPUT -i eth1 -p tcp --dport 22 -m conntrack --ctstate NEW -j DROP 2>/dev/null || \
+          iptables -I INPUT 1 -i eth1 -p tcp --dport 22 -m conntrack --ctstate NEW -j DROP
+      args:
+        executable: /bin/bash
+
+    - name: Enable and restart knockd
+      ansible.builtin.systemd:
+        name: knockd
+        enabled: true
+        state: restarted
+
+    - name: Save inetRouter firewall rules
+      ansible.builtin.command: netfilter-persistent save
+      changed_when: true
+
+
+# ============================================================
+# 2. centralRouter: маршрутизация и port knocking
+# ============================================================
+
+- name: Configure centralRouter and send port knocking
+  hosts: central_router
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install knock client
+      ansible.builtin.apt:
+        name: knockd
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Enable IPv4 forwarding
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        state: present
+        sysctl_set: true
+        reload: true
+
+    - name: Configure persistent routes
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-routing.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=OTUS lab routing
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/ip route replace default via 192.168.255.1 dev eth1
+          ExecStart=/sbin/ip route replace 192.168.50.0/24 via 192.168.0.3 dev eth2
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable routing service
+      ansible.builtin.systemd:
+        name: lab-routing.service
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Send port knocking sequence to inetRouter
+      ansible.builtin.command:
+        argv:
+          - knock
+          - -d
+          - "300"
+          - 192.168.255.1
+          - "7000"
+          - "8000"
+          - "9000"
+      changed_when: true
+
+    - name: Wait for SSH to open on inetRouter
+      ansible.builtin.wait_for:
+        host: 192.168.255.1
+        port: 22
+        state: started
+        timeout: 30
+        delay: 1
+
+
+# ============================================================
+# 3. Проверка доступа к inetRouter после port knocking
+# ============================================================
+
+- name: Verify inetRouter access after port knocking
+  hosts: inet_router
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check SSH access
+      ansible.builtin.command: id
+      changed_when: false
+
+
+# ============================================================
+# 4. inetRouter2: DNAT 8080 -> centralServer:80
+#    MASQUERADE на inetRouter2 НЕ используется
+# ============================================================
+
+- name: Configure inetRouter2 and HTTP forwarding
+  hosts: inet_router2
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install iptables persistence
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Enable IPv4 forwarding
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        state: present
+        sysctl_set: true
+        reload: true
+
+    - name: Configure persistent routes
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-routing.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=OTUS lab routing
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/ip route replace default via 192.168.0.1 dev eth1
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable routing service
+      ansible.builtin.systemd:
+        name: lab-routing.service
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Configure DNAT and forwarding without MASQUERADE
+      ansible.builtin.shell: |
+        set -e
+
+        # Удаляем старое правило для Host-Only, если оно было сохранено.
+        iptables -t nat -D PREROUTING -i eth2 -p tcp --dport 8080 \
+          -j DNAT --to-destination 192.168.0.2:80 2>/dev/null || true
+
+        # VirtualBox NAT port forwarding: eth0:8080 -> centralServer:80.
+        iptables -t nat -C PREROUTING -i eth0 -p tcp --dport 8080 \
+          -j DNAT --to-destination 192.168.0.2:80 2>/dev/null || \
+        iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 \
+          -j DNAT --to-destination 192.168.0.2:80
+
+        # Разрешаем запрос к centralServer.
+        iptables -C FORWARD -i eth0 -o eth1 -p tcp \
+          -d 192.168.0.2 --dport 80 \
+          -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i eth0 -o eth1 -p tcp \
+          -d 192.168.0.2 --dport 80 \
+          -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+
+        # Разрешаем ответ centralServer.
+        iptables -C FORWARD -i eth1 -o eth0 -p tcp \
+          -s 192.168.0.2 --sport 80 \
+          -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i eth1 -o eth0 -p tcp \
+          -s 192.168.0.2 --sport 80 \
+          -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      args:
+        executable: /bin/bash
+
+    - name: Save inetRouter2 firewall rules
+      ansible.builtin.command: netfilter-persistent save
+      changed_when: true
+
+
+# ============================================================
+# 5. centralServer: nginx и маршрутизация
+# ============================================================
+
+- name: Configure centralServer and nginx
+  hosts: central_server
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Deploy nginx index page
+      ansible.builtin.copy:
+        src: templates/index.html.j2
+        dest: /var/www/html/index.html
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable and start nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: started
+
+    - name: Configure persistent routes
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-routing.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=OTUS lab routing
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/ip route replace default via 192.168.0.1 dev eth1
+          ExecStart=/sbin/ip route replace 192.168.50.0/24 via 192.168.0.3 dev eth1
+          ExecStart=/sbin/ip route replace 10.0.2.2/32 via 192.168.0.3 dev eth1
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable routing service
+      ansible.builtin.systemd:
+        name: lab-routing.service
+        enabled: true
+        state: restarted
+        daemon_reload: true
